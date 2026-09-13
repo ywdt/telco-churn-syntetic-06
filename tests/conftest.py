@@ -26,7 +26,7 @@ def sample_raw_df() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "customerID": ["0001", "0002", "0003", "0004", "0005"],
-            "tenure": ["1", "24", "60", "12", "6"],  # int  ← DO NOT change
+            "tenure": [1, 24, 60, 12, 6],  # int  ← DO NOT change
             "MonthlyCharges": [29.85, 56.95, 42.30, 89.10, 20.05],
             "TotalCharges": [29.85, 1889.50, 2320.80, 1138.80, 172.70],
             "SeniorCitizen": [0, 0, 1, 0, 0],
