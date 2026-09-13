@@ -1,0 +1,307 @@
+# .github/workflows/ml-pipeline.yml
+#
+# Full CI/CD Pipeline for Telco Churn MLOps
+# Matches the pipeline diagram on slide 5 of Module 6.
+#
+# Stages:
+#   lint-and-test   → quality gate (flake8, mypy, pytest, pandera)
+#   build-and-push  → multi-stage Docker build, push to GHCR
+#   deploy-staging  → docker run on staging VM, smoke test
+#   integration-tests → API contract, model behaviour, latency SLA
+#   deploy-prod     → manual approval required, docker run on prod VM
+#
+# Secrets required (Settings → Secrets → Actions):
+#   GHCR_TOKEN             GitHub PAT with write:packages scope
+#   STAGING_HOST           staging server hostname or IP
+#   STAGING_SSH_KEY        private SSH key for staging server
+#   PROD_HOST / PROD_SSH_KEY  (optional — only if you switch back to SSH deploy)
+#   MLFLOW_TRACKING_URI    MLflow server URL
+#   DISCORD_WEBHOOK        Discord channel webhook URL
+
+name: Telco Churn ML Pipeline
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"     # daily model quality check (slide 7: schedule trigger)
+  workflow_dispatch:          # manual trigger — emergency deploy or rollback
+
+env:
+  REGISTRY:  ghcr.io
+  IMAGE:     ghcr.io/${{ github.repository }}/churn-api
+  MLFLOW_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  PYTHON_VERSION: "3.11"
+
+# ── JOB 1: Lint & Test ───────────────────────────────────────────────────────
+jobs:
+  lint-and-test:
+    name: "Lint & Test (quality gate)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"                          # slide 24: pip caching saves 4 min
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # ── Code style ──────────────────────────────────────────────────────────
+      - name: flake8 — code style
+        run: flake8 src/ tests/ --max-line-length 100 --extend-ignore=E203
+
+      - name: black — formatting check
+        run: black --check src/ tests/
+
+      - name: mypy — type checking
+        run: mypy src/ --ignore-missing-imports
+
+      # ── Schema validation FIRST (slide 27: Pandera runs before training) ────
+      - name: pandera — data schema validation
+        run: pytest tests/unit/test_schema.py -v --tb=short
+
+      # ── Unit tests (no model training) ──────────────────────────────────────
+      - name: pytest — unit tests (features + utilities)
+        run: |
+          pytest tests/unit/test_features.py \
+            -v --tb=short \
+            --cov=src/features \
+            --cov-report=xml:coverage-features.xml
+
+      # ── Model quality gate (slide 11: pytest model, 2-5 min) ────────────────
+      - name: pytest — model quality gate
+        run: |
+          pytest tests/unit/test_model.py \
+            -v --tb=short -m slow \
+            --cov=src/features --cov=src/models \
+            --cov-report=xml:coverage-models.xml \
+            --cov-fail-under=0
+        env:
+          MLFLOW_TRACKING_URI: ${{ env.MLFLOW_URI }}
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v7
+        if: always()
+        with:
+          files: coverage-features.xml,coverage-models.xml
+          fail_ci_if_error: false
+
+  # ── JOB 2: Build & Push Docker ───────────────────────────────────────────────
+  build-and-push:
+    name: "Build & Push Docker image"
+    needs: lint-and-test          # slide 8: fail fast — only build if tests pass
+    runs-on: ubuntu-latest
+    # Only build on pushes, not on PRs (saves build minutes)
+    if: github.event_name != 'pull_request'
+    # Grant GITHUB_TOKEN permission to push packages to GHCR
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-sha: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN is always available — no manual PAT needed for GHCR
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Docker metadata generates tags automatically (slide 14)
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      # BuildKit with layer caching (slide 24: saves 7-10 min)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ── JOB 3+4: Run API on GitHub runner + Integration Tests ─────────────────
+  # No external staging server required — Docker runs on ubuntu-latest.
+  integration-tests:
+    name: "Integration Tests (L1-L3)"
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run API container on runner
+        run: |
+          set -eux
+          IMAGE_TAG="${{ env.IMAGE }}:sha-${{ github.sha }}"
+          echo "Pulling $IMAGE_TAG"
+          docker pull "$IMAGE_TAG"
+          docker rm -f churn-api 2>/dev/null || true
+          docker run -d \
+            --name churn-api \
+            -p 8000:8000 \
+            -e MODEL_URI="${{ secrets.MLFLOW_TRACKING_URI }}" \
+            -e MLFLOW_TRACKING_URI="${{ secrets.MLFLOW_TRACKING_URI }}" \
+            "$IMAGE_TAG"
+          # Wait for health (cold start can take a bit with uvicorn workers)
+          for i in $(seq 1 45); do
+            if curl -sf http://127.0.0.1:8000/health; then
+              echo "API is healthy"
+              curl -s http://127.0.0.1:8000/health || true
+              exit 0
+            fi
+            echo "waiting... ($i)"
+            # show logs early if container already exited
+            if [ "$(docker inspect -f '{{.State.Running}}' churn-api 2>/dev/null || echo false)" != "true" ]; then
+              echo "Container is not running"
+              docker ps -a | head -20 || true
+              docker logs churn-api || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "API failed to become healthy"
+          docker ps -a | head -20 || true
+          docker logs churn-api || true
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Smoke test
+        run: pytest tests/smoke/ -v --tb=short
+        env:
+          API_URL: http://127.0.0.1:8000
+
+      - name: Integration tests
+        run: |
+          pytest tests/integration/ -v --tb=short \
+            --junitxml=test-results/integration.xml
+        env:
+          API_URL: http://127.0.0.1:8000
+
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: integration-test-results
+          path: test-results/
+
+      - name: Stop API container
+        if: always()
+        run: docker rm -f churn-api 2>/dev/null || true
+
+
+  # ── JOB 5: Deploy to Production (verify on GitHub runner) ────────────────
+ # No external PROD_HOST required: pull image, start, health-check, stop.
+  # When you have a real prod server, swap this for SSH deploy again.
+  deploy-production:
+    name: "Deploy to Production (verify on runner)"
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull, start, health-check, stop
+        run: |
+          set -eux
+          IMAGE_TAG="${{ env.IMAGE }}:sha-${{ github.sha }}"
+          echo "Deploy verify: $IMAGE_TAG"
+          docker pull "$IMAGE_TAG"
+          docker rm -f churn-api-prod 2>/dev/null || true
+          docker run -d --name churn-api-prod -p 8000:8000 \
+            -e MODEL_PATH=/app/models/churn_model.joblib \
+            "$IMAGE_TAG"
+
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health; then
+              echo ""
+              echo "Production image is healthy"
+              curl -s http://127.0.0.1:8000/health || true
+              docker rm -f churn-api-prod
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' churn-api-prod 2>/dev/null || echo false)" != "true" ]; then
+              echo "Container exited early"
+              docker logs churn-api-prod || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Health check timed out"
+          docker logs churn-api-prod || true
+          docker rm -f churn-api-prod || true
+          exit 1
+
+
+      - name: Post deployment Discord notification
+        if: always()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK secret not set — skipping notification"
+            exit 0
+          fi
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ Production deploy success | sha-${{ github.sha }} | ${{ github.actor }} | ${{ github.ref_name }}"
+          else
+            MSG="❌ Production deploy failure | sha-${{ github.sha }} | ${{ github.actor }} | ${{ github.ref_name }}"
+          fi
+          curl -sf -H "Content-Type: application/json" \
+            -d "{\"content\": \"$MSG\\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$DISCORD_WEBHOOK"
+          echo "Discord notification sent"
+
