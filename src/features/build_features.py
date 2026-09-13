@@ -17,6 +17,8 @@ from typing import List
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
+import nonexistent_lib
+
 logger = logging.getLogger(__name__)
 
 # ── Canonical feature list ────────────────────────────────────────────────────
